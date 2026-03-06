@@ -1,0 +1,12 @@
+services:
+  agent:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - ./workspace:/app/workspace      # temp repo clones
+      - ./data:/app/data                # SQLite database
+      - ~/.claude:/root/.claude:ro       # Enterprise session, read-only
+      - ~/.claude.json:/root/.claude.json:ro  # Claude config file
+      - ~/.ssh:/root/.ssh:ro             # SSH keys for git clone

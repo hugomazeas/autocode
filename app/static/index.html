@@ -1,0 +1,900 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AutoCode Agent</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+        .pulse-dot { animation: pulse-dot 1.5s ease-in-out infinite; }
+        #log-panel::-webkit-scrollbar { width: 6px; }
+        #log-panel::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+        .claude-text { line-height: 1.6; }
+        .tool-row { transition: background 0.15s; }
+        .tool-row:hover { background: rgba(255,255,255,0.03); }
+        .bar-segment { transition: width 0.4s ease; }
+        .job-list-row { transition: background 0.15s; }
+        .job-list-row:hover { background: rgba(255,255,255,0.04); cursor: pointer; }
+    </style>
+</head>
+<body class="h-full bg-gray-950 text-gray-100 font-mono">
+
+<div id="app" class="flex flex-col h-full"></div>
+
+<script>
+/* ====================================================================
+   AutoCode Agent — Single Page Application
+   ==================================================================== */
+
+const STATUS_MAP = {
+    queued:     { color: 'bg-yellow-400', dot: 'bg-yellow-400', text: 'text-yellow-400', label: 'Queued',     pulse: true },
+    running:    { color: 'bg-yellow-400', dot: 'bg-yellow-400', text: 'text-yellow-400', label: 'Running',    pulse: true },
+    planning:   { color: 'bg-blue-400',   dot: 'bg-blue-400',   text: 'text-blue-400',   label: 'Planning',   pulse: true },
+    coding:     { color: 'bg-purple-400', dot: 'bg-purple-400', text: 'text-purple-400', label: 'Coding',     pulse: true },
+    committing: { color: 'bg-orange-400', dot: 'bg-orange-400', text: 'text-orange-400', label: 'Committing', pulse: true },
+    done:       { color: 'bg-green-400',  dot: 'bg-green-400',  text: 'text-green-400',  label: 'Done',       pulse: false },
+    failed:     { color: 'bg-red-400',    dot: 'bg-red-400',    text: 'text-red-400',    label: 'Failed',     pulse: false },
+    cancelled:  { color: 'bg-gray-400',   dot: 'bg-gray-400',   text: 'text-gray-400',   label: 'Cancelled',  pulse: false },
+};
+
+const TERMINAL_STATUSES = new Set(['done', 'failed', 'cancelled']);
+const CANCELABLE_STATUSES = new Set(['queued', 'running', 'planning', 'coding', 'committing']);
+
+/* ====================================================================
+   Utilities
+   ==================================================================== */
+
+function esc(s) {
+    if (typeof s !== 'string') s = String(s);
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+}
+
+function timeAgo(ts) {
+    const secs = Math.floor((Date.now() / 1000) - ts);
+    if (secs < 60) return 'just now';
+    if (secs < 3600) return Math.floor(secs / 60) + 'm ago';
+    if (secs < 86400) return Math.floor(secs / 3600) + 'h ago';
+    return Math.floor(secs / 86400) + 'd ago';
+}
+
+function fmtTokens(n) {
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+    return String(n);
+}
+
+function shortPath(p) {
+    const parts = p.split('/');
+    if (parts.length <= 3) return p;
+    return '.../' + parts.slice(-2).join('/');
+}
+
+function truncate(s, max) {
+    if (!s) return '';
+    return s.length > max ? s.slice(0, max) + '...' : s;
+}
+
+/* ====================================================================
+   Client-side Router
+   ==================================================================== */
+
+function navigate(path) {
+    history.pushState(null, '', path);
+    route();
+}
+
+window.addEventListener('popstate', route);
+
+function route() {
+    const path = window.location.pathname;
+    if (path.startsWith('/jobs/')) {
+        const jobId = path.split('/')[2];
+        showJobView(jobId);
+    } else {
+        showDashboard();
+    }
+}
+
+/* ====================================================================
+   Dashboard
+   ==================================================================== */
+
+let dashboardRefreshTimer = null;
+
+function showDashboard() {
+    // Clean up any previous job view state
+    cleanupJobView();
+
+    const app = document.getElementById('app');
+    app.innerHTML = `
+        <!-- Top bar -->
+        <div class="flex items-center justify-between px-6 py-4 border-b border-gray-800 shrink-0">
+            <h1 class="text-lg font-bold text-white">AutoCode</h1>
+        </div>
+
+        <!-- Main content -->
+        <div class="flex-1 overflow-y-auto">
+            <div class="max-w-6xl mx-auto px-6 py-6 space-y-6">
+
+                <!-- New Job -->
+                <div class="bg-gray-900/60 border border-gray-800 rounded-lg p-5">
+                    <h2 class="text-sm text-gray-400 uppercase tracking-wide mb-4">New Job</h2>
+                    <div class="flex flex-col gap-3">
+                        <div class="flex gap-3 items-end flex-wrap">
+                            <div class="flex-1 min-w-[200px]">
+                                <label class="block text-xs text-gray-500 mb-1">Repository</label>
+                                <select id="new-job-repo"
+                                    class="w-full bg-gray-900 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500">
+                                    <option value="">Select a repository...</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-xs text-gray-500 mb-1">Ticket Description</label>
+                            <textarea id="new-job-ticket" rows="3" placeholder="Describe what needs to be done..."
+                                class="w-full bg-gray-900 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500 resize-y"></textarea>
+                        </div>
+                        <div>
+                            <button id="new-job-submit" onclick="submitNewJob()"
+                                class="bg-blue-600 hover:bg-blue-500 text-white px-5 py-2 rounded text-sm font-medium transition-colors">
+                                Submit Job
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+
+                    <!-- Repositories -->
+                    <div class="bg-gray-900/60 border border-gray-800 rounded-lg p-5">
+                        <h2 class="text-sm text-gray-400 uppercase tracking-wide mb-4">Repositories</h2>
+                        <div id="repos-list" class="space-y-2 mb-4">
+                            <div class="text-xs text-gray-600">Loading...</div>
+                        </div>
+                        <div class="border-t border-gray-800 pt-4 mt-4">
+                            <div class="text-xs text-gray-500 mb-2">Add Repository</div>
+                            <div class="flex gap-2 items-end flex-wrap">
+                                <div class="flex-1 min-w-[180px]">
+                                    <input id="add-repo-url" type="text" placeholder="https://github.com/org/repo.git"
+                                        class="w-full bg-gray-900 border border-gray-700 rounded px-3 py-1.5 text-xs focus:outline-none focus:border-blue-500">
+                                </div>
+                                <div class="w-28">
+                                    <input id="add-repo-branch" type="text" placeholder="main"
+                                        class="w-full bg-gray-900 border border-gray-700 rounded px-3 py-1.5 text-xs focus:outline-none focus:border-blue-500">
+                                </div>
+                                <button onclick="addRepo()"
+                                    class="bg-gray-700 hover:bg-gray-600 text-white px-3 py-1.5 rounded text-xs font-medium transition-colors">
+                                    Add
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Recent Jobs -->
+                    <div class="bg-gray-900/60 border border-gray-800 rounded-lg p-5">
+                        <h2 class="text-sm text-gray-400 uppercase tracking-wide mb-4">Recent Jobs</h2>
+                        <div id="jobs-list" class="space-y-1">
+                            <div class="text-xs text-gray-600">Loading...</div>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+        </div>
+    `;
+
+    loadDashboardData();
+    dashboardRefreshTimer = setInterval(loadDashboardData, 10000);
+}
+
+let _cachedRepos = [];
+
+async function loadDashboardData() {
+    try {
+        const [reposResp, jobsResp] = await Promise.all([
+            fetch('/api/repos'),
+            fetch('/api/jobs'),
+        ]);
+        const repos = await reposResp.json();
+        const jobs = await jobsResp.json();
+        _cachedRepos = repos;
+        renderReposList(repos);
+        renderJobsList(jobs, repos);
+        populateRepoDropdown(repos);
+    } catch (err) {
+        console.error('Failed to load dashboard data:', err);
+    }
+}
+
+function renderReposList(repos) {
+    const container = document.getElementById('repos-list');
+    if (!container) return;
+
+    if (repos.length === 0) {
+        container.innerHTML = '<div class="text-xs text-gray-600">No repositories yet. Add one below.</div>';
+        return;
+    }
+
+    container.innerHTML = repos.map(r => `
+        <div class="flex items-center justify-between bg-gray-900 rounded px-3 py-2 group">
+            <div class="min-w-0 flex-1">
+                <div class="text-sm text-gray-200 font-medium truncate">${esc(r.name)}</div>
+                <div class="text-xs text-gray-600 truncate">${esc(r.url)}</div>
+                <div class="text-xs text-gray-600">branch: ${esc(r.default_branch)}</div>
+            </div>
+            <button onclick="deleteRepo(${r.id})"
+                class="ml-3 text-gray-700 hover:text-red-400 transition-colors text-sm opacity-0 group-hover:opacity-100"
+                title="Delete repository">X</button>
+        </div>
+    `).join('');
+}
+
+function renderJobsList(jobs, repos) {
+    const container = document.getElementById('jobs-list');
+    if (!container) return;
+
+    if (jobs.length === 0) {
+        container.innerHTML = '<div class="text-xs text-gray-600">No jobs yet.</div>';
+        return;
+    }
+
+    const repoMap = {};
+    for (const r of repos) repoMap[r.id] = r;
+
+    container.innerHTML = jobs.map(j => {
+        const s = STATUS_MAP[j.status] || STATUS_MAP.queued;
+        const repo = repoMap[j.repo_id];
+        const repoName = repo ? repo.name : '?';
+        const cost = j.total_cost ? `$${j.total_cost.toFixed(2)}` : '';
+        const ago = j.created_at ? timeAgo(j.created_at) : '';
+
+        return `
+            <div class="job-list-row flex items-center gap-3 px-3 py-2 rounded" onclick="navigate('/jobs/${esc(j.id)}')">
+                <div class="w-2 h-2 rounded-full shrink-0 ${s.dot}${s.pulse ? ' pulse-dot' : ''}"></div>
+                <div class="flex-1 min-w-0">
+                    <div class="text-sm text-gray-300 truncate">${esc(truncate(j.ticket, 80))}</div>
+                    <div class="text-xs text-gray-600">${esc(repoName)}</div>
+                </div>
+                <div class="text-right shrink-0">
+                    <div class="text-xs text-gray-500">${ago}</div>
+                    ${cost ? `<div class="text-xs text-gray-600">${cost}</div>` : ''}
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+function populateRepoDropdown(repos) {
+    const sel = document.getElementById('new-job-repo');
+    if (!sel) return;
+    const currentVal = sel.value;
+    sel.innerHTML = '<option value="">Select a repository...</option>' +
+        repos.map(r => `<option value="${r.id}"${String(r.id) === currentVal ? ' selected' : ''}>${esc(r.name)}</option>`).join('');
+}
+
+async function addRepo() {
+    const urlInput = document.getElementById('add-repo-url');
+    const branchInput = document.getElementById('add-repo-branch');
+    const url = urlInput.value.trim();
+    if (!url) return;
+
+    const branch = branchInput.value.trim() || undefined;
+
+    try {
+        await fetch('/api/repos', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url, default_branch: branch }),
+        });
+        urlInput.value = '';
+        branchInput.value = '';
+        loadDashboardData();
+    } catch (err) {
+        console.error('Failed to add repo:', err);
+    }
+}
+
+async function deleteRepo(repoId) {
+    try {
+        await fetch(`/api/repos/${repoId}`, { method: 'DELETE' });
+        loadDashboardData();
+    } catch (err) {
+        console.error('Failed to delete repo:', err);
+    }
+}
+
+async function submitNewJob() {
+    const repoSel = document.getElementById('new-job-repo');
+    const ticketEl = document.getElementById('new-job-ticket');
+    const btn = document.getElementById('new-job-submit');
+
+    const repoId = parseInt(repoSel.value, 10);
+    const ticket = ticketEl.value.trim();
+    if (!repoId || !ticket) return;
+
+    // Determine base_branch from the selected repo
+    const repo = _cachedRepos.find(r => r.id === repoId);
+    const baseBranch = repo ? repo.default_branch : 'main';
+
+    btn.disabled = true;
+    btn.textContent = 'Submitting...';
+
+    try {
+        const resp = await fetch('/api/jobs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ repo_id: repoId, ticket, base_branch: baseBranch }),
+        });
+        const data = await resp.json();
+        navigate(`/jobs/${data.job_id}`);
+    } catch (err) {
+        console.error('Failed to create job:', err);
+        btn.disabled = false;
+        btn.textContent = 'Submit Job';
+    }
+}
+
+/* ====================================================================
+   Job View
+   ==================================================================== */
+
+let jobSSE = null;
+let jobDurationTimer = null;
+let jobTurnCount = 0;
+let jobStartTime = null;
+let jobTotalCost = 0;
+let jobContextWindow = 200000;
+let jobCurrentStatus = null;
+let jobCurrentId = null;
+
+function cleanupJobView() {
+    if (jobSSE) { jobSSE.close(); jobSSE = null; }
+    if (jobDurationTimer) { clearInterval(jobDurationTimer); jobDurationTimer = null; }
+    if (dashboardRefreshTimer) { clearInterval(dashboardRefreshTimer); dashboardRefreshTimer = null; }
+    jobTurnCount = 0;
+    jobStartTime = null;
+    jobTotalCost = 0;
+    jobContextWindow = 200000;
+    jobCurrentStatus = null;
+    jobCurrentId = null;
+}
+
+async function showJobView(jobId) {
+    cleanupJobView();
+    jobCurrentId = jobId;
+
+    const app = document.getElementById('app');
+    app.innerHTML = `
+        <!-- Top bar -->
+        <div class="flex items-center justify-between px-6 py-4 border-b border-gray-800 shrink-0">
+            <div class="flex items-center gap-3">
+                <a href="/" onclick="event.preventDefault(); navigate('/')" class="text-lg font-bold text-white hover:text-blue-400 transition-colors">AutoCode</a>
+                <div id="status-badge" class="flex items-center gap-2 ml-3 px-3 py-1 rounded-full bg-gray-800 text-xs">
+                    <div id="status-dot" class="w-2 h-2 rounded-full bg-gray-600"></div>
+                    <span id="status-text" class="text-gray-500">Loading</span>
+                </div>
+            </div>
+            <div class="flex items-center gap-3">
+                <button id="cancel-btn" class="hidden text-xs bg-red-700 hover:bg-red-600 text-white px-3 py-1.5 rounded transition-colors font-medium"
+                    onclick="cancelJob('${esc(jobId)}')">
+                    Cancel
+                </button>
+                <div id="pr-section" class="hidden">
+                    <a id="pr-link" href="#" target="_blank"
+                       class="inline-block bg-green-700 hover:bg-green-600 text-white px-4 py-1.5 rounded text-xs font-medium transition-colors">
+                        View Pull Request &rarr;
+                    </a>
+                </div>
+            </div>
+        </div>
+
+        <!-- Workspace -->
+        <div class="flex-1 flex min-h-0">
+            <!-- Main log panel -->
+            <div class="flex-1 flex flex-col min-w-0">
+                <div id="log-panel" class="flex-1 overflow-y-auto px-6 py-4 space-y-1"></div>
+                <!-- Follow-up input -->
+                <div id="followup-bar" class="hidden border-t border-gray-800 px-6 py-3 shrink-0">
+                    <div class="flex gap-2 items-end">
+                        <textarea id="followup-input" rows="2" placeholder="Send a follow-up prompt..."
+                            class="flex-1 bg-gray-900 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500 resize-none"
+                            onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendFollowup();}"></textarea>
+                        <button id="followup-btn" onclick="sendFollowup()"
+                            class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded text-sm font-medium transition-colors shrink-0">
+                            Send
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Sidebar -->
+            <div class="w-72 border-l border-gray-800 flex flex-col overflow-y-auto shrink-0">
+                <!-- Context window -->
+                <div class="px-4 py-4 border-b border-gray-800">
+                    <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Context Window</div>
+                    <div class="relative h-4 bg-gray-900 rounded-full overflow-hidden mb-2">
+                        <div id="ctx-bar-input" class="bar-segment absolute left-0 top-0 h-full bg-blue-600" style="width:0%"></div>
+                        <div id="ctx-bar-output" class="bar-segment absolute top-0 h-full bg-purple-600" style="left:0%;width:0%"></div>
+                    </div>
+                    <div class="flex items-baseline gap-2 mb-2">
+                        <div id="ctx-pct" class="text-lg font-bold text-white">0%</div>
+                        <div id="ctx-total" class="text-xs text-gray-500"></div>
+                    </div>
+                    <div class="space-y-1 text-xs">
+                        <div class="flex items-center gap-2">
+                            <div class="w-2.5 h-2.5 rounded-sm bg-blue-600"></div>
+                            <span class="text-gray-400">Input + cache</span>
+                            <span id="ctx-input" class="ml-auto text-gray-300">0</span>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <div class="w-2.5 h-2.5 rounded-sm bg-purple-600"></div>
+                            <span class="text-gray-400">Output</span>
+                            <span id="ctx-output" class="ml-auto text-gray-300">0</span>
+                        </div>
+                        <div class="flex items-center gap-2 mt-1 pt-1 border-t border-gray-800/50">
+                            <span class="text-gray-500">Total processed</span>
+                            <span id="ctx-processed" class="ml-auto text-gray-500">0</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Usage -->
+                <div class="px-4 py-4 border-b border-gray-800">
+                    <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Session Usage</div>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <div class="text-xs text-gray-500">Cost</div>
+                            <div id="stat-cost" class="text-sm font-semibold text-white">$0.00</div>
+                        </div>
+                        <div>
+                            <div class="text-xs text-gray-500">Duration</div>
+                            <div id="stat-duration" class="text-sm font-semibold text-white">0s</div>
+                        </div>
+                        <div>
+                            <div class="text-xs text-gray-500">Turns</div>
+                            <div id="stat-turns" class="text-sm font-semibold text-white">0</div>
+                        </div>
+                        <div>
+                            <div class="text-xs text-gray-500">Phase</div>
+                            <div id="stat-phase" class="text-sm font-semibold text-white">Loading</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Rate limit (5h) -->
+                <div class="px-4 py-4 border-b border-gray-800">
+                    <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Rate Limit (5h)</div>
+                    <div class="relative h-3 bg-gray-900 rounded-full overflow-hidden mb-2">
+                        <div id="rate-bar" class="bar-segment absolute left-0 top-0 h-full bg-green-500 rounded-full" style="width:0%"></div>
+                    </div>
+                    <div class="flex justify-between text-xs">
+                        <span id="rate-label" class="text-gray-400">No data yet</span>
+                        <span id="rate-resets" class="text-gray-600"></span>
+                    </div>
+                </div>
+
+                <!-- Passes -->
+                <div class="px-4 py-4">
+                    <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Passes</div>
+                    <div id="passes-list" class="space-y-2 text-xs"></div>
+                </div>
+            </div>
+        </div>
+    `;
+
+    // Fetch existing job data first
+    try {
+        const resp = await fetch(`/api/jobs/${jobId}`);
+        if (!resp.ok) {
+            appendLog('error', `<span class="text-red-400 font-bold text-xs">ERROR:</span> <span class="text-red-300 text-xs">Job not found</span>`);
+            return;
+        }
+        const job = await resp.json();
+
+        // Set initial status
+        setStatus(job.status);
+        jobCurrentStatus = job.status;
+        updateCancelButton(job.status, jobId);
+        updateFollowupBar(job.status);
+
+        if (job.pr_url) showPR(job.pr_url);
+
+        // Set start time from job data
+        if (job.created_at) {
+            jobStartTime = job.created_at * 1000;
+        }
+
+        // Replay historical events
+        if (job.events && job.events.length > 0) {
+            for (const event of job.events) {
+                renderEvent(event);
+            }
+        }
+
+        // Update phase text
+        const s = STATUS_MAP[job.status];
+        if (s) updateStat('stat-phase', s.label);
+
+        if (TERMINAL_STATUSES.has(job.status)) {
+            // Job is finished — show final duration
+            if (job.updated_at && job.created_at) {
+                const secs = Math.floor(job.updated_at - job.created_at);
+                const m = Math.floor(secs / 60);
+                const sec = secs % 60;
+                updateStat('stat-duration', m > 0 ? `${m}m ${sec}s` : `${sec}s`);
+            }
+        } else {
+            // Job is still running — connect SSE for live updates and start duration timer
+            jobDurationTimer = setInterval(updateDuration, 1000);
+            connectSSE(jobId);
+        }
+    } catch (err) {
+        console.error('Failed to load job:', err);
+        appendLog('error', `<span class="text-red-400 font-bold text-xs">ERROR:</span> <span class="text-red-300 text-xs">Failed to load job data</span>`);
+    }
+}
+
+function connectSSE(jobId) {
+    if (jobSSE) { jobSSE.close(); }
+
+    // Clear log and state — SSE replays from the beginning
+    const logPanel = document.getElementById('log-panel');
+    if (logPanel) logPanel.innerHTML = '';
+    document.getElementById('passes-list').innerHTML = '';
+    jobTurnCount = 0;
+    jobTotalCost = 0;
+    updateStat('stat-turns', '0');
+    updateStat('stat-cost', '$0.00');
+
+    const source = new EventSource(`/api/jobs/${jobId}/stream`);
+    jobSSE = source;
+
+    source.onmessage = (e) => {
+        const event = JSON.parse(e.data);
+
+        if (event.type === 'done') {
+            source.close();
+            jobSSE = null;
+            if (jobDurationTimer) { clearInterval(jobDurationTimer); jobDurationTimer = null; }
+            setStatus(event.status);
+            jobCurrentStatus = event.status;
+            updateCancelButton(event.status, jobId);
+            updateFollowupBar(event.status);
+            updateStat('stat-phase', event.status === 'done' ? 'Done' : event.status === 'cancelled' ? 'Cancelled' : 'Failed');
+            if (event.pr_url) showPR(event.pr_url);
+            return;
+        }
+        if (event.type === 'status') {
+            setStatus(event.status);
+            jobCurrentStatus = event.status;
+            updateCancelButton(event.status, jobId);
+            updateFollowupBar(event.status);
+            const s = STATUS_MAP[event.status];
+            if (s) updateStat('stat-phase', s.label);
+            return;
+        }
+        renderEvent(event);
+    };
+
+    source.onerror = () => {
+        source.close();
+        jobSSE = null;
+        if (jobDurationTimer) { clearInterval(jobDurationTimer); jobDurationTimer = null; }
+        // Only mark as failed if not already terminal
+        if (!TERMINAL_STATUSES.has(jobCurrentStatus)) {
+            setStatus('failed');
+            updateStat('stat-phase', 'Connection lost');
+        }
+    };
+}
+
+function updateCancelButton(status, jobId) {
+    const btn = document.getElementById('cancel-btn');
+    if (!btn) return;
+    if (CANCELABLE_STATUSES.has(status)) {
+        btn.classList.remove('hidden');
+        btn.disabled = false;
+        btn.textContent = 'Cancel';
+    } else {
+        btn.classList.add('hidden');
+    }
+}
+
+function updateFollowupBar(status) {
+    const bar = document.getElementById('followup-bar');
+    if (!bar) return;
+    if (TERMINAL_STATUSES.has(status)) {
+        bar.classList.remove('hidden');
+        const input = document.getElementById('followup-input');
+        const btn = document.getElementById('followup-btn');
+        if (input) { input.disabled = false; input.value = ''; }
+        if (btn) { btn.disabled = false; btn.textContent = 'Send'; }
+    } else {
+        bar.classList.add('hidden');
+    }
+}
+
+async function sendFollowup() {
+    const input = document.getElementById('followup-input');
+    const btn = document.getElementById('followup-btn');
+    const prompt = input ? input.value.trim() : '';
+    if (!prompt || !jobCurrentId) return;
+
+    btn.disabled = true;
+    btn.textContent = 'Sending...';
+    input.disabled = true;
+
+    try {
+        const resp = await fetch(`/api/jobs/${jobCurrentId}/followup`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt }),
+        });
+        if (!resp.ok) {
+            const err = await resp.json();
+            appendLog('error', `<span class="text-red-400 font-bold text-xs">ERROR:</span> <span class="text-red-300 text-xs">${esc(err.detail || 'Failed to send follow-up')}</span>`);
+            btn.disabled = false;
+            btn.textContent = 'Send';
+            input.disabled = false;
+            return;
+        }
+
+        // Hide follow-up bar and reconnect SSE
+        document.getElementById('followup-bar').classList.add('hidden');
+        jobStartTime = Date.now();
+        jobDurationTimer = setInterval(updateDuration, 1000);
+        connectSSE(jobCurrentId);
+    } catch (err) {
+        console.error('Failed to send follow-up:', err);
+        btn.disabled = false;
+        btn.textContent = 'Send';
+        input.disabled = false;
+    }
+}
+
+async function cancelJob(jobId) {
+    const btn = document.getElementById('cancel-btn');
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Cancelling...';
+        btn.classList.add('opacity-50');
+    }
+    try {
+        await fetch(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
+    } catch (err) {
+        console.error('Failed to cancel job:', err);
+    }
+}
+
+/* ====================================================================
+   Job View — Status & Sidebar Updates
+   ==================================================================== */
+
+function setStatus(status) {
+    const s = STATUS_MAP[status] || STATUS_MAP.queued;
+    const dot = document.getElementById('status-dot');
+    const text = document.getElementById('status-text');
+    if (!dot || !text) return;
+    dot.className = `w-2 h-2 rounded-full ${s.dot}` + (s.pulse ? ' pulse-dot' : '');
+    text.textContent = s.label;
+    text.className = `${s.text} text-xs`;
+}
+
+function showPR(url) {
+    const link = document.getElementById('pr-link');
+    const section = document.getElementById('pr-section');
+    if (!link || !section) return;
+    link.href = url;
+    section.classList.remove('hidden');
+}
+
+function updateStat(id, value) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value;
+}
+
+function updateDuration() {
+    if (!jobStartTime) return;
+    const secs = Math.floor((Date.now() - jobStartTime) / 1000);
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    updateStat('stat-duration', m > 0 ? `${m}m ${s}s` : `${s}s`);
+}
+
+function updateContext(usage) {
+    const input = (usage.input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
+    const output = usage.output_tokens || 0;
+    const windowUsed = input + output;
+    const pct = Math.min(100, (windowUsed / jobContextWindow) * 100);
+
+    const inputPct = Math.min(100, (input / jobContextWindow) * 100);
+    const outputPct = Math.min(100 - inputPct, (output / jobContextWindow) * 100);
+
+    const setEl = (id, val) => { const el = document.getElementById(id); if (el) el.style.width = val; };
+    const setStyle = (id, prop, val) => { const el = document.getElementById(id); if (el) el.style[prop] = val; };
+
+    setEl('ctx-bar-input', inputPct + '%');
+    setStyle('ctx-bar-output', 'left', inputPct + '%');
+    setEl('ctx-bar-output', outputPct + '%');
+
+    updateStat('ctx-pct', Math.round(pct) + '%');
+    updateStat('ctx-total', `${fmtTokens(windowUsed)} / ${fmtTokens(jobContextWindow)}`);
+    updateStat('ctx-input', fmtTokens(input));
+    updateStat('ctx-output', fmtTokens(output));
+
+    const totalProcessed = input + (usage.cache_read_input_tokens || 0) + output;
+    updateStat('ctx-processed', fmtTokens(totalProcessed));
+}
+
+function updateRateLimit(info) {
+    if (!info) return;
+    const bar = document.getElementById('rate-bar');
+    const label = document.getElementById('rate-label');
+    const resets = document.getElementById('rate-resets');
+    if (!bar || !label) return;
+
+    if (info.status === 'allowed') {
+        bar.style.width = '30%';
+        bar.className = 'bar-segment absolute left-0 top-0 h-full bg-green-500 rounded-full';
+        label.textContent = 'OK';
+    } else {
+        bar.style.width = '100%';
+        bar.className = 'bar-segment absolute left-0 top-0 h-full bg-red-500 rounded-full';
+        label.textContent = 'Rate limited';
+    }
+    if (info.resetsAt && resets) {
+        const resetDate = new Date(info.resetsAt * 1000);
+        const diff = Math.max(0, Math.floor((resetDate - Date.now()) / 60000));
+        resets.textContent = diff > 0 ? `Resets in ${diff}m` : '';
+    }
+}
+
+function addPass(event) {
+    const list = document.getElementById('passes-list');
+    if (!list) return;
+    const subtype = event.subtype === 'error_max_turns' ? ' (max turns)' : '';
+    const cost = event.total_cost_usd ? `$${event.total_cost_usd.toFixed(2)}` : '';
+    const turns = event.num_turns || 0;
+    const dur = event.duration_ms ? `${(event.duration_ms / 1000).toFixed(0)}s` : '';
+
+    const el = document.createElement('div');
+    el.className = 'bg-gray-900 rounded px-3 py-2';
+    el.innerHTML = `
+        <div class="flex justify-between items-center mb-1">
+            <span class="text-gray-300">Pass ${list.children.length + 1}${esc(subtype)}</span>
+            <span class="text-gray-500">${esc(cost)}</span>
+        </div>
+        <div class="flex gap-3 text-gray-500">
+            <span>${turns} turns</span>
+            <span>${esc(dur)}</span>
+        </div>
+    `;
+    list.appendChild(el);
+}
+
+/* ====================================================================
+   Event Rendering
+   ==================================================================== */
+
+function renderEvent(event) {
+    const t = event.type;
+
+    if (t === 'system') {
+        appendLog('system', `<span class="text-gray-500 text-xs">${esc(event.content)}</span>`);
+    } else if (t === 'error') {
+        appendLog('error', `<span class="text-red-400 font-bold text-xs">ERROR:</span> <span class="text-red-300 text-xs">${esc(event.content)}</span>`);
+    } else if (t === 'assistant') {
+        const contentBlocks = (event.message && event.message.content && Array.isArray(event.message.content))
+            ? event.message.content
+            : (event.content && Array.isArray(event.content) ? event.content : null);
+
+        if (contentBlocks) {
+            for (const block of contentBlocks) {
+                if (block.type === 'text' && block.text) {
+                    appendLog('text', renderMarkdownText(block.text));
+                } else if (block.type === 'tool_use') {
+                    jobTurnCount++;
+                    updateStat('stat-turns', String(jobTurnCount));
+                    appendLog('tool', renderToolUse(block));
+                }
+            }
+        }
+    } else if (t === 'result') {
+        if (event.total_cost_usd) {
+            jobTotalCost += event.total_cost_usd;
+            updateStat('stat-cost', `$${jobTotalCost.toFixed(2)}`);
+        }
+        if (event.usage) updateContext(event.usage);
+        if (event.modelUsage) {
+            const model = Object.values(event.modelUsage)[0];
+            if (model && model.contextWindow) jobContextWindow = model.contextWindow;
+        }
+        addPass(event);
+    } else if (t === 'rate_limit_event') {
+        updateRateLimit(event.rate_limit_info);
+    } else {
+        const toolName = event.tool_name || (event.content_block && event.content_block.name);
+        if (toolName) {
+            jobTurnCount++;
+            updateStat('stat-turns', String(jobTurnCount));
+            appendLog('tool', renderToolUse({ name: toolName, input: event.input || event.content_block?.input || {} }));
+        } else if (event.content) {
+            const text = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
+            appendLog('text', `<span class="text-gray-300 text-sm">${esc(text)}</span>`);
+        }
+    }
+}
+
+function appendLog(kind, html) {
+    const panel = document.getElementById('log-panel');
+    if (!panel) return;
+    const el = document.createElement('div');
+
+    if (kind === 'text') {
+        el.className = 'claude-text text-sm text-gray-200 py-2 px-3 bg-gray-900/50 rounded-lg my-2 leading-relaxed';
+    } else if (kind === 'tool') {
+        el.className = 'tool-row text-xs py-1.5 px-3 rounded my-0.5';
+    } else if (kind === 'system') {
+        el.className = 'py-1 px-3';
+    } else if (kind === 'error') {
+        el.className = 'py-1.5 px-3 bg-red-950/30 rounded my-1';
+    } else {
+        el.className = 'py-1 px-3';
+    }
+
+    el.innerHTML = html;
+    panel.appendChild(el);
+    panel.scrollTop = panel.scrollHeight;
+}
+
+function renderMarkdownText(text) {
+    let html = esc(text);
+    html = html.replace(/\*\*(.*?)\*\*/g, '<strong class="text-white">$1</strong>');
+    html = html.replace(/`([^`]+)`/g, '<code class="bg-gray-800 text-blue-300 px-1 rounded text-xs">$1</code>');
+    html = html.replace(/\n/g, '<br>');
+    return html;
+}
+
+function renderToolUse(block) {
+    const icons = {
+        Read:  '<span class="text-blue-400">R</span>',
+        Edit:  '<span class="text-yellow-400">E</span>',
+        Write: '<span class="text-green-400">W</span>',
+        Bash:  '<span class="text-orange-400">$</span>',
+        Grep:  '<span class="text-cyan-400">G</span>',
+        Glob:  '<span class="text-teal-400">F</span>',
+    };
+    const name = block.name || 'tool';
+    const icon = icons[name] || '<span class="text-gray-400">&bull;</span>';
+    const input = block.input || {};
+
+    let label = name;
+    if (name === 'Read' && input.file_path) label = shortPath(input.file_path);
+    else if (name === 'Edit' && input.file_path) label = shortPath(input.file_path);
+    else if (name === 'Write' && input.file_path) label = shortPath(input.file_path);
+    else if (name === 'Bash' && input.command) label = input.command.length > 80 ? input.command.slice(0, 80) + '...' : input.command;
+    else if (name === 'Grep' && input.pattern) label = `grep ${input.pattern}`;
+    else if (name === 'Glob' && input.pattern) label = `glob ${input.pattern}`;
+
+    const isBash = name === 'Bash';
+    const cls = isBash ? 'bg-gray-800/60 px-2 py-0.5 rounded font-mono' : '';
+
+    return `<span class="inline-flex items-center gap-2">
+        <span class="w-5 text-center font-bold">${icon}</span>
+        <span class="text-gray-500">${esc(name)}</span>
+        <span class="text-gray-400 ${cls} truncate">${esc(label)}</span>
+    </span>`;
+}
+
+/* ====================================================================
+   Boot
+   ==================================================================== */
+
+route();
+</script>
+
+</body>
+</html>
